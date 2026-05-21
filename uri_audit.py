@@ -7,10 +7,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
-from common import as_list
+from common import as_list, item_name_values
 from config import DEREF_TIMEOUT
 from models import ConversionResult, DerefCheck, UriPatternInfo
-from common import item_name_values
 
 
 DEREF_TITLE_RE = re.compile(
@@ -273,6 +272,16 @@ def deref_text_candidates(check: DerefCheck) -> set[str]:
     out.update(x.casefold() for x in check.pref_labels if x)
     return out
 
+def _report_uri_issue(
+    result: ConversionResult,
+    *,
+    strict: bool,
+    message: str,
+) -> None:
+    if strict:
+        result.error(message)
+    else:
+        result.warn(message)
 
 def audit_item_uris(
     session: requests.Session,
@@ -281,6 +290,7 @@ def audit_item_uris(
     items: list[dict[str, Any]],
     uri_pattern: str,
     result: ConversionResult,
+    strict_uri_audit: bool = False,
 ) -> None:
     for item in items:
         item_code = str(item.get("itemCode") or "").strip()
@@ -293,9 +303,13 @@ def audit_item_uris(
         try:
             item_uri = normalize_uri(str(item_uri_raw))
         except ValueError:
-            result.warn(
-                f"itemCode={item_code} has invalid URI {item_uri_raw!r}; "
-                f"probe={probe_uri(session, str(item_uri_raw))}"
+            _report_uri_issue(
+                result,
+                strict=strict_uri_audit,
+                message=(
+                    f"itemCode={item_code} has invalid URI {item_uri_raw!r}; "
+                    f"probe={probe_uri(session, str(item_uri_raw))}"
+                ),
             )
             continue
 
@@ -309,9 +323,13 @@ def audit_item_uris(
         expected_base = uri_pattern
 
         if item_uri.rstrip("/") == uri_pattern.rstrip("/"):
-            result.warn(
-                f"item URI missing tail: itemCode={item_code}, uri={item_uri}. "
-                f"Resolved canonical URI to {expected_uri}."
+            _report_uri_issue(
+                result,
+                strict=strict_uri_audit,
+                message=(
+                    f"item URI missing tail: itemCode={item_code}, uri={item_uri}. "
+                    f"Resolved canonical URI to {expected_uri}."
+                ),
             )
             continue
 
@@ -344,22 +362,34 @@ def audit_item_uris(
 
         if current_tail == expected_tail and current_base != expected_base:
             if expected_check.ok and expected_matches and not (current_check.ok and current_matches):
-                result.warn(
-                    f"item URI base mismatch: itemCode={item_code}, uri={item_uri}. "
-                    f"Dereference indicates canonical URI is {expected_uri}."
+                _report_uri_issue(
+                    result,
+                    strict=strict_uri_audit,
+                    message=(
+                        f"item URI base mismatch: itemCode={item_code}, uri={item_uri}. "
+                        f"Dereference indicates canonical URI is {expected_uri}."
+                    )
                 )
             else:
-                result.warn(
-                    f"item URI base mismatch: itemCode={item_code}, uri={item_uri}. "
-                    f"Current base={current_base}, canonical base={expected_base}."
+                _report_uri_issue(
+                    result,
+                    strict=strict_uri_audit,
+                    message=(
+                        f"item URI base mismatch: itemCode={item_code}, uri={item_uri}. "
+                        f"Current base={current_base}, canonical base={expected_base}."
+                    )
                 )
             continue
 
         if current_tail != expected_tail and current_base == expected_base:
-            result.warn(
-                f"item URI tail mismatch: itemCode={item_code}, uri={item_uri}. "
-                f"Expected tail {expected_tail!r}, got {current_tail!r}. "
-                f"Using canonical URI {expected_uri}."
+            _report_uri_issue(
+                result,
+                strict=strict_uri_audit,
+                message=(
+                        f"item URI tail mismatch: itemCode={item_code}, uri={item_uri}. "
+                    f"Expected tail {expected_tail!r}, got {current_tail!r}. "
+                    f"Using canonical URI {expected_uri}."
+                )
             )
             result.info(
                 f"resolved tail mismatch for {item_code}: current tail={current_tail!r}, "
@@ -368,14 +398,22 @@ def audit_item_uris(
             continue
 
         if expected_check.ok and expected_matches and not (current_check.ok and current_matches):
-            result.warn(
-                f"item URI mismatch: itemCode={item_code}, uri={item_uri}. "
-                f"Dereference indicates canonical URI is {expected_uri}."
+            _report_uri_issue(
+                result,
+                strict=strict_uri_audit,
+                message=(
+                    f"item URI mismatch: itemCode={item_code}, uri={item_uri}. "
+                    f"Dereference indicates canonical URI is {expected_uri}."
+                )
             )
         else:
-            result.warn(
-                f"item URI mismatch: itemCode={item_code}, uri={item_uri}. "
-                f"Using canonical URI {expected_uri}."
+            _report_uri_issue(
+                result,
+                strict=strict_uri_audit,
+                message=(
+                    "item URI mismatch: itemCode={item_code}, uri={item_uri}. "
+                    f"Using canonical URI {expected_uri}."
+                )
             )
 
         if current_tail != expected_tail:

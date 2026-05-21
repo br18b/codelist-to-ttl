@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Mapping
 
 import requests
@@ -7,8 +8,9 @@ import xmltodict
 
 from common import (
     as_list,
-    extract_lang_literals,
+    is_fresh_file,
     load_json,
+    normalize_item_identity_row,
     parse_iso_date,
     parse_iso_datetime,
     require_date,
@@ -21,10 +23,12 @@ from config import (
     CODELIST_XML_URL,
     REQUEST_TIMEOUT,
 )
+from graph_ttl import create_codelist_graph_from_payload
+from graph_payload_io import load_code_to_ontology
 from models import ConversionResult
+from normalize_graph import normalize_codelist_payload
 from owner import fetch_publisher_ico_from_header
 from paths import ProjectPaths
-from ttl import build_codelist_definition, build_items_definition
 from uri_audit import audit_item_uris, infer_uri_pattern
 
 
@@ -42,7 +46,21 @@ def fetch_json(
     *,
     result: ConversionResult | None = None,
     request_key: str | None = None,
+    cache_path=None,
+    max_cache_age_seconds: int = 86400,
 ) -> dict[str, Any]:
+    if cache_path is not None and is_fresh_file(cache_path, max_age_seconds=max_cache_age_seconds):
+        if result is not None and request_key is not None:
+            result.request_status[request_key] = {
+                "ok": True,
+                "status": None,
+                "reason": "fresh local cache",
+                "url": url,
+                "cached": True,
+                "cacheFile": str(cache_path),
+            }
+        return load_json(cache_path)
+
     response = session.get(url, timeout=REQUEST_TIMEOUT)
 
     if result is not None and request_key is not None:
@@ -51,6 +69,7 @@ def fetch_json(
             "status": response.status_code,
             "reason": response.reason,
             "url": url,
+            "cached": False,
         }
 
     if result is not None and response.status_code >= 500:
@@ -62,7 +81,10 @@ def fetch_json(
         )
 
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+    if cache_path is not None:
+        write_json(cache_path, data)
+    return data
 
 
 def try_fetch_integration_xml(
@@ -106,64 +128,60 @@ def try_fetch_integration_xml(
     paths.xml_file.write_text(xml_text, encoding="utf-8")
 
     try:
-        xml_data = xmltodict.parse(
-            xml_text,
-            force_list=("CodelistName", "CodelistItem", "ItemName", "Note"),
-        )
-        write_json(paths.integration_json_file, xml_data)
-        result.integration_status = {
-            "ok": True,
-            "status": response.status_code,
-            "endpoint": "integration",
-        }
+        parsed = xmltodict.parse(xml_text)
     except Exception as exc:
+        result.warn(f"integration xml parse failed: {type(exc).__name__}: {exc}")
         result.integration_status = {
             "ok": True,
             "status": response.status_code,
+            "reason": response.reason,
             "endpoint": "integration",
             "xmlParsed": False,
-            "parseError": f"{type(exc).__name__}: {exc}",
         }
-        result.warn(
-            f"integration XML downloaded but JSON conversion failed: "
-            f"{type(exc).__name__}: {exc}"
-        )
+        return
+
+    write_json(paths.integration_json_file, parsed)
+    result.integration_status = {
+        "ok": True,
+        "status": response.status_code,
+        "reason": response.reason,
+        "endpoint": "integration",
+        "xmlParsed": True,
+    }
 
 
-def record_rank(row: Mapping[str, Any]) -> tuple[Any, ...]:
-    valid_from = parse_iso_datetime(row.get("validFrom"))
-    ts = valid_from.timestamp() if valid_from is not None else 0.0
+def record_rank(item: Mapping[str, Any]) -> tuple[Any, ...]:
+    valid_from = parse_iso_datetime(str(item.get("validFrom") or ""))
+    valid_from_rank = -valid_from.timestamp() if valid_from is not None else 0.0
+
+    effective_to = parse_iso_datetime(item.get("effectiveTo"))
+    effective_to_rank = float("-inf") if effective_to is None else -effective_to.timestamp()
 
     return (
-        0 if bool(row.get("published", True)) else 1,
-        0 if not bool(row.get("temporal")) else 1,
-        state_rank(str(row.get("codelistItemState") or row.get("codelistState") or "")),
-        0 if row.get("effectiveTo") is None else 1,
-        -ts,
-        -int(row.get("id") or 0),
+        state_rank(str(item.get("codelistItemState") or "")),
+        effective_to_rank,
+        valid_from_rank,
+        0 if not bool(item.get("temporal")) else 1,
+        -int(item.get("id") or 0),
     )
 
 
 def is_current_published_item(row: Mapping[str, Any]) -> bool:
     return (
-        bool(row.get("published", True))
-        and str(row.get("codelistItemState") or row.get("codelistState") or "").strip() == "PUBLISHED"
+        str(row.get("codelistItemState") or "").strip() == "PUBLISHED"
         and not bool(row.get("temporal"))
-        and row.get("effectiveTo") is None
+        and row.get("published") is not False
     )
 
 
 def item_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "id": int(row.get("id") or 0),
-        "state": row.get("codelistItemState") or row.get("codelistState"),
-        "published": bool(row.get("published", True)),
+        "state": row.get("codelistItemState"),
         "temporal": bool(row.get("temporal")),
+        "published": row.get("published"),
         "validFrom": row.get("validFrom"),
-        "effectiveFrom": row.get("effectiveFrom"),
-        "effectiveTo": row.get("effectiveTo"),
-        "locked": bool(row.get("locked")),
-        "lockedBy": row.get("lockedBy"),
+        "itemCode": row.get("itemCode"),
     }
 
 
@@ -197,7 +215,7 @@ def select_best_items(
     items_json: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     raw_items = [
-        x
+        normalize_item_identity_row(x)
         for x in as_list(items_json.get("codelistsItems"))
         if isinstance(x, Mapping)
     ]
@@ -229,19 +247,14 @@ def select_best_items(
     return selected, duplicate_issues
 
 
-def load_code_to_ontology(path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    return load_json(path)
-
-
-def codelist_to_ttl(
+def fetch_and_normalize_codelist(
     code: str,
     *,
     codelist_id: int,
     session: requests.Session,
     project_paths: ProjectPaths | None = None,
-) -> ConversionResult:
+    strict_uri_audit: bool = False,
+) -> tuple[ConversionResult, dict[str, Any] | None, dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
     project_paths = project_paths or ProjectPaths.default()
     project_paths.ensure_base_dirs()
 
@@ -257,8 +270,8 @@ def codelist_to_ttl(
             result.request_urls["json_header"],
             result=result,
             request_key="json_header",
+            cache_path=paths.header_json_file,
         )
-        write_json(paths.header_json_file, header)
 
         header_code = str(header.get("code") or "").strip()
         if header_code and header_code != code:
@@ -266,16 +279,30 @@ def codelist_to_ttl(
                 f"requested code={code} but header id={codelist_id} returned code={header_code}"
             )
 
+        if not bool(header.get("base")):
+            result.warn("header is not base=true; skipping normalization and ttl generation")
+            return result, None, {}, {}
+
         items_json = fetch_json(
             session,
             result.request_urls["json_items"],
             result=result,
             request_key="json_items",
+            cache_path=paths.items_json_file,
         )
-        write_json(paths.items_json_file, items_json)
 
         selected_items, item_duplicate_issues = select_best_items(items_json)
         result.item_duplicate_issues.extend(item_duplicate_issues)
+
+        recovered_count = sum(
+            1 for item in selected_items
+            if bool(item.get("itemUriRecoveredFromItemCode"))
+        )
+        if recovered_count:
+            result.warn(
+                f"recovered {recovered_count} item URI(s) from URI-like itemCode values "
+                f"where itemUri was null/empty"
+            )
 
         for issue in item_duplicate_issues:
             if issue["kind"] == "conflict":
@@ -287,15 +314,10 @@ def codelist_to_ttl(
 
         selected_items_json = {"codelistsItems": selected_items}
 
-        names_label = extract_lang_literals(header.get("codelistNames"))
-        notes_label = extract_lang_literals(header.get("codelistNotes"))
-
         valid_from = require_date(
             parse_iso_date(header.get("validFrom")),
             "header validFrom",
         )
-        effective_from = parse_iso_date(header.get("effectiveFrom")) or valid_from
-        effective_to = parse_iso_date(header.get("effectiveTo"))
 
         item_valid_dates = [
             dt
@@ -303,7 +325,7 @@ def codelist_to_ttl(
             for dt in [parse_iso_date(item.get("validFrom"))]
             if dt is not None
         ]
-        last_modified = max(item_valid_dates) if item_valid_dates else valid_from
+        last_modified: date | None = max(item_valid_dates) if item_valid_dates else valid_from
 
         publisher_ico = fetch_publisher_ico_from_header(session, header, result)
 
@@ -320,62 +342,73 @@ def codelist_to_ttl(
             items=selected_items,
             uri_pattern=uri_pattern,
             result=result,
+            strict_uri_audit=strict_uri_audit,
         )
+
+        if strict_uri_audit and result.errors:
+            result.block_validation(
+                f"strict URI audit failed with {len(result.errors)} blocking issue(s)"
+            )
 
         code_to_ontology = load_code_to_ontology(project_paths.ontology_map_file)
-        ontology_entries = code_to_ontology.get(code, {})
+        ontology_entry = code_to_ontology.get(code, {})
 
-        prefixes = [
-            "@prefix skos: <http://www.w3.org/2004/02/skos/core#>.",
-            "@prefix dct: <http://purl.org/dc/terms/>.",
-            "@prefix dcat: <http://www.w3.org/ns/dcat#>.",
-            "@prefix prov: <http://www.w3.org/ns/prov#> .",
-            "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .",
-            "@prefix egov: <https://data.gov.sk/def/ontology/egov/>.",
-            "@prefix codelist: <https://data.gov.sk/set/codelist/>.",
-            f"@prefix {codelist_label}: <{uri_pattern}>.",
-            "@prefix leg: <https://data.gov.sk/def/ontology/legislation/>.",
-        ]
-
-        item_types: list[str] = ["skos:Concept"]
-        for qualified_name, prefix_decl in ontology_entries.items():
-            item_types.insert(0, qualified_name)
-            prefixes.append(prefix_decl)
-
-        prefixes = list(dict.fromkeys(prefixes))
-        current_version_uri = f"<https://data.gov.sk/set/codelist/{code}/{valid_from}>"
-
-        codelist_definition = build_codelist_definition(
+        codelist_record, item_records, hierarchy_stubs = normalize_codelist_payload(
             code=code,
-            current_version_uri=current_version_uri,
-            names_label=names_label,
-            notes_label=notes_label,
-            uri_pattern=uri_pattern,
-            valid_from=valid_from,
-            effective_from=effective_from,
-            effective_to=effective_to,
-            last_modified=last_modified,
-            publisher_ico=publisher_ico,
-        )
-
-        items_definition = build_items_definition(
-            code=code,
-            valid_from=valid_from,
-            codelist_label=codelist_label,
+            header=header,
             items=selected_items,
-            item_types=item_types,
+            uri_pattern=uri_pattern,
+            item_prefix=codelist_label,
+            publisher_ico=publisher_ico,
+            last_modified=last_modified,
+            ontology_entry=ontology_entry,
         )
 
-        ttl_text = "\n".join(prefixes) + "\n\n" + codelist_definition
-        if items_definition:
-            ttl_text += "\n\n" + items_definition
-        ttl_text += "\n"
+        if result.validation_blocked:
+            return result, codelist_record, item_records, hierarchy_stubs
 
-        paths.ttl_file.write_text(ttl_text, encoding="utf-8")
+        return result, codelist_record, item_records, hierarchy_stubs
+
+    except Exception as exc:
+        result.error(f"{type(exc).__name__}: {exc}")
+        return result, None, {}, {}
+
+
+def write_ttl_from_payload(
+    *,
+    code: str,
+    codelists: dict[str, dict[str, Any]],
+    items: dict[int, dict[str, Any]],
+    hierarchies: dict[int, dict[str, Any]],
+    result: ConversionResult,
+    project_paths: ProjectPaths | None = None,
+    relation_predicates: Mapping[str, Mapping[str, str]] | None = None,
+) -> ConversionResult:
+    project_paths = project_paths or ProjectPaths.default()
+    project_paths.ensure_base_dirs()
+    paths = project_paths.for_code(code)
+
+    if result.validation_blocked:
+        result.info(
+            f"ttl emission skipped because validation is blocked: "
+            f"{'; '.join(result.validation_block_reasons)}"
+        )
+        return result
+
+    try:
+        graph = create_codelist_graph_from_payload(
+            code=code,
+            codelists=codelists,
+            items=items,
+            hierarchies=hierarchies,
+            relation_predicates=relation_predicates,
+        )
+        ttl_text = graph.serialize(format="turtle")
+        paths.ttl_file.write_text(str(ttl_text), encoding="utf-8")
+
         result.ttl_file = paths.ttl_file
         result.created = True
         return result
-
     except Exception as exc:
         result.error(f"{type(exc).__name__}: {exc}")
         return result

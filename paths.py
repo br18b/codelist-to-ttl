@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
 @dataclass(frozen=True)
 class CodePaths:
     xml_file: Path
@@ -15,15 +18,26 @@ class CodePaths:
 
 @dataclass(frozen=True)
 class ProjectPaths:
+    project_root: Path
     data_root: Path
     issues_root: Path
 
     @classmethod
-    def default(cls) -> "ProjectPaths":
-        return cls(
-            data_root=Path("data"),
-            issues_root=Path("issues"),
-        )
+    def default(
+        cls,
+        *,
+        project_root: Path | None = None,
+        data_root: Path | None = None,
+        issues_root: Path | None = None,
+    ) -> "ProjectPaths":
+        root = (project_root or PROJECT_ROOT).resolve()
+        data = data_root if data_root is not None else root / "data"
+        issues = issues_root if issues_root is not None else root / "issues"
+        if not data.is_absolute():
+            data = root / data
+        if not issues.is_absolute():
+            issues = root / issues
+        return cls(project_root=root, data_root=data.resolve(), issues_root=issues.resolve())
 
     @property
     def xml_dir(self) -> Path:
@@ -38,16 +52,48 @@ class ProjectPaths:
         return self.data_root / "ttl"
 
     @property
-    def rdf_dir(self) -> Path:
-        return self.data_root / "rdf"
+    def input_dir(self) -> Path:
+        return self.project_root / "input"
+
+    @property
+    def config_dir(self) -> Path:
+        return self.project_root / "config"
+
+    @property
+    def default_config_file(self) -> Path:
+        return self.config_dir / "config.json"
 
     @property
     def jsonld_dir(self) -> Path:
         return self.data_root / "jsonld"
 
     @property
+    def codelist_headers_file(self) -> Path:
+        return self.json_dir / "codelistheaders.json"
+
+    @property
     def ontology_map_file(self) -> Path:
         return self.json_dir / "codelist_to_ontology.json"
+
+    @property
+    def normalized_codelists_file(self) -> Path:
+        return self.json_dir / "codelists.json"
+
+    @property
+    def normalized_items_file(self) -> Path:
+        return self.json_dir / "items.json"
+
+    @property
+    def normalized_hierarchies_file(self) -> Path:
+        return self.json_dir / "hierarchies.json"
+
+    @property
+    def hierarchy_no_match_issue_file(self) -> Path:
+        return self.issues_root / "hierarchies_no_match.json"
+
+    @property
+    def hierarchy_ambiguous_issue_file(self) -> Path:
+        return self.issues_root / "hierarchies_ambiguous.json"
 
     @property
     def warnings_report_file(self) -> Path:
@@ -62,7 +108,8 @@ class ProjectPaths:
             self.xml_dir,
             self.json_dir,
             self.ttl_dir,
-            self.rdf_dir,
+            self.input_dir,
+            self.config_dir,
             self.jsonld_dir,
             self.issues_root,
         ):

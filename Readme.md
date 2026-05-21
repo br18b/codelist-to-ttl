@@ -251,3 +251,141 @@ This will:
 - duplicate rows are not silently ignored (selected based on ranking, reported)
 - URI auditing is opinionated: it will choose a canonical pattern even when the source data is inconsistent, and it records those inconsistencies as warnings
 - output is designed to be **human-inspectable** and **machine-auditable**
+
+## Current patched behavior
+
+This version keeps the modular graph-based pipeline, but adds the config-driven behavior used by the standalone converter.
+
+### Project-root-safe paths
+
+`main.py` can now be launched from any working directory. Paths are resolved relative to the directory containing `main.py` unless explicitly overridden.
+
+Default paths:
+
+```text
+input/*.rdf                 ontology RDF inputs
+data/json/*.json            cached JSON payloads + normalized payloads
+data/xml/*.xml              integration XML payloads
+data/ttl/*.ttl              generated Turtle files
+issues/*.json               audit and issue reports
+config/config.json          hierarchy / ignore / relation predicate config
+```
+
+### JSON caching
+
+Header and item JSON files are reused when they are younger than one day by default. Older or missing JSON files are fetched again.
+
+```bash
+python main.py --cache-max-age-seconds 86400
+```
+
+The integration XML endpoint is still fetched during processing so HTTP 500 failures can be reported for contractor tickets.
+
+### Config-driven hierarchy and ignore list
+
+The default config path is:
+
+```text
+config/config.json
+```
+
+You can provide another config file:
+
+```bash
+python main.py --config /path/to/config.json
+```
+
+Supported keys:
+
+```json
+{
+  "hierarchy": {
+    "CHILD_CODE": "PARENT_CODE_OR_EXTERNAL_URI_BASE"
+  },
+  "relationPredicates": {
+    "codelistItemIncludes": {
+      "predicate": "skos:broader",
+      "inversePredicate": "skos:narrower"
+    },
+    "codelistItemIncludesAlso": {
+      "predicate": "skos:related"
+    },
+    "codelistItemExcludes": {
+      "predicate": "egov:excludes",
+      "inversePredicate": "egov:isExcludedBy"
+    }
+  },
+  "externalRelationPredicates": {
+    "https://data.gov.sk/id/legal-subject/": {
+      "codelistItemIncludes": "skos:broader",
+      "codelistItemIncludesAlso": "skos:related",
+      "codelistItemExcludes": "egov:excludes"
+    }
+  },
+  "ignore": {
+    "CODE": {"reason": "handled elsewhere"}
+  }
+}
+```
+
+`relationPredicates` controls internal codelist-to-codelist relations. The forward predicate is emitted from source item to target item; the inverse predicate is emitted when the target item is present in the generated graph. The config may use either the canonical internal keys (`includes`, `includesAlso`, `excludes`) or the original MetaIS field names (`codelistItemIncludes`, `codelistItemIncludesAlso`, `codelistItemExcludes`). The compact flat form is also accepted, e.g. `"includesPredicate": "skos:broader"`, `"codelistItemIncludesPredicate": "skos:broader"`, and `"includesPredicateInverse": "skos:narrower"`.
+
+Ignored codelists are still fetched and normalized for analysis, so they can serve as configured parents, but TTL files are not emitted for them.
+
+### External URI hierarchy targets
+
+If a hierarchy parent is an external URI base, e.g.
+
+```json
+{
+  "hierarchy": {
+    "CL000644": "https://data.gov.sk/id/legal-subject/"
+  }
+}
+```
+
+then an item include value like `35683813` emits:
+
+```turtle
+skos:broader <https://data.gov.sk/id/legal-subject/35683813> ;
+```
+
+The external predicate is configurable through `externalRelationPredicates`. Prefer the nested relation-specific form so only the intended relation key is emitted:
+
+```json
+{
+  "externalRelationPredicates": {
+    "https://data.gov.sk/id/legal-subject/": {
+      "codelistItemIncludes": "skos:broader"
+    }
+  }
+}
+```
+
+Supported predicate shorthands include any QName using the bound prefixes `skos`, `dct`, `dcat`, `prov`, `rdfs`, `egov`, `pper`, `leg`, `fin`, `lsub`, and `loca`, plus full HTTP(S) predicate URIs. That means project-specific predicates such as `egov:excludes` can be configured without changing Python code.
+
+### URI-in-itemCode recovery
+
+The pipeline now recovers MetaIS rows where the item URI was accidentally stored in `itemCode` while `itemUri` is null, for example:
+
+```json
+{
+  "itemCode": "http://eidas.europa.eu/LoA/high",
+  "itemUri": null
+}
+```
+
+This is normalized internally as:
+
+```json
+{
+  "itemCode": "high",
+  "itemUri": "http://eidas.europa.eu/LoA/high"
+}
+```
+
+The conversion result records a warning with the number of recovered rows.
+
+### `codelist_to_ontology.json`
+
+This file is generated automatically from the ontology RDF files in `input/*.rdf`. It maps codelist codes to ontology classes whose `dct:source` points at that codelist. If no ontology classes reference a particular codelist, conversion still works; the items are emitted as plain `skos:Concept` values.

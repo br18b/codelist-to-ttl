@@ -5,19 +5,20 @@ from typing import Any, Mapping
 
 import requests
 
-from common import parse_iso_datetime, state_rank
+from common import is_fresh_file, load_json, parse_iso_datetime, state_rank, write_json
 from config import CODELIST_HEADERS_URL, REQUEST_TIMEOUT
+from paths import ProjectPaths
 from models import CodelistRef
 
 
 def _header_rank_key(header: dict[str, Any]) -> tuple[Any, ...]:
     """
-    Ranking header by the following order of precedence (reorder here if you want to pick duplicit rows in some other order)
-    1) state (PUBLISHED > READY_TO_PUBLISH > ISVS_PROCESSING > UPDATING > SOME_OTHER_SHIT_I_HAVENT_SEEN_YET)
-    2) effectiveTo (further in the future = better, None means infinitely far into the future)
+    Ranking header by the following order of precedence:
+    1) state (PUBLISHED > READY_TO_PUBLISH > ISVS_PROCESSING > UPDATING > ...)
+    2) effectiveTo (further in the future = better, None means infinitely far)
     3) validFrom (more recent is better)
-    4) temporal state (False is better than True) ("príznak, či je číselník v časovej verzii" some kind of time versioning, but from the sound of it False means good)
-    5) larger id wins as the final tiebreaker (cuz why not)
+    4) temporal state (False is better than True)
+    5) larger id wins as final tiebreaker
     """
     valid_from = parse_iso_datetime(str(header.get("validFrom") or ""))
     valid_from_rank = -valid_from.timestamp() if valid_from is not None else 0.0
@@ -34,10 +35,11 @@ def _header_rank_key(header: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _is_current_published_header(row: Mapping[str, Any]) -> bool:
+def _is_current_published_base_header(row: Mapping[str, Any]) -> bool:
     return (
         str(row.get("codelistState") or "").strip() == "PUBLISHED"
         and not bool(row.get("temporal"))
+        and bool(row.get("base"))
         and row.get("effectiveTo") is None
     )
 
@@ -47,6 +49,7 @@ def _header_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
         "id": int(row.get("id") or 0),
         "state": row.get("codelistState"),
         "temporal": bool(row.get("temporal")),
+        "base": bool(row.get("base")),
         "validFrom": row.get("validFrom"),
         "effectiveFrom": row.get("effectiveFrom"),
         "effectiveTo": row.get("effectiveTo"),
@@ -63,14 +66,14 @@ def _classify_header_duplicate_issue(
         return None
 
     selected = rows_sorted[0]
-    canonical = [row for row in rows_sorted if _is_current_published_header(row)]
+    canonical = [row for row in rows_sorted if _is_current_published_base_header(row)]
 
     if len(canonical) > 1:
         kind = "conflict"
-        reason = "multiple current published non-temporal headers"
+        reason = "multiple current published non-temporal base headers"
     else:
         kind = "shadow"
-        reason = "one canonical header plus non-canonical shadow variants"
+        reason = "one canonical base header plus non-canonical shadow variants"
 
     return {
         "code": code,
@@ -81,18 +84,38 @@ def _classify_header_duplicate_issue(
     }
 
 
-def fetch_codelist_headers_raw(session: requests.Session) -> list[dict[str, Any]]:
-    response = session.get(CODELIST_HEADERS_URL, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
+def fetch_codelist_headers_raw(
+    session: requests.Session,
+    *,
+    project_paths: ProjectPaths | None = None,
+    max_cache_age_seconds: int = 86400,
+) -> list[dict[str, Any]]:
+    project_paths = project_paths or ProjectPaths.default()
+    cache_path = project_paths.codelist_headers_file
+
+    if is_fresh_file(cache_path, max_age_seconds=max_cache_age_seconds):
+        data = load_json(cache_path)
+    else:
+        response = session.get(CODELIST_HEADERS_URL, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        write_json(cache_path, data)
+
     codelists = data.get("codelists", [])
     return [x for x in codelists if isinstance(x, dict)]
 
 
 def fetch_codelist_refs(
     session: requests.Session,
+    *,
+    project_paths: ProjectPaths | None = None,
+    max_cache_age_seconds: int = 86400,
 ) -> tuple[list[CodelistRef], list[dict[str, Any]]]:
-    raw = fetch_codelist_headers_raw(session)
+    raw = fetch_codelist_headers_raw(
+        session,
+        project_paths=project_paths,
+        max_cache_age_seconds=max_cache_age_seconds,
+    )
 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in raw:
@@ -105,8 +128,14 @@ def fetch_codelist_refs(
     duplicate_issues: list[dict[str, Any]] = []
 
     for code in sorted(grouped):
-        rows = grouped[code]
-        rows_sorted = sorted(rows, key=_header_rank_key)
+        rows_all = grouped[code]
+        rows_base = [row for row in rows_all if bool(row.get("base"))]
+
+        if not rows_base:
+            # explicitly skip codes with no base header at all
+            continue
+
+        rows_sorted = sorted(rows_base, key=_header_rank_key)
         chosen = rows_sorted[0]
 
         refs.append(
@@ -115,6 +144,7 @@ def fetch_codelist_refs(
                 code=code,
                 state=str(chosen.get("codelistState") or ""),
                 temporal=bool(chosen.get("temporal")),
+                base=bool(chosen.get("base")),
             )
         )
 

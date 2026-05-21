@@ -104,6 +104,8 @@ def write_per_codelist_issue_reports(
             "ttlFile": str(result.ttl_file) if result.ttl_file is not None else None,
             "integrationStatus": result.integration_status,
             "http5xx": result.http_5xx,
+            "validationBlocked": result.validation_blocked,
+            "validationBlockReasons": result.validation_block_reasons,
         }
 
         if has_warning_payload:
@@ -198,4 +200,20 @@ def write_issue_reports(
     return {
         "warnings": project_paths.warnings_report_file,
         "errors": project_paths.errors_report_file,
+    }
+
+def write_hierarchy_issue_reports(
+    *,
+    project_paths: ProjectPaths,
+    hierarchies_no_match: dict[int, dict[str, Any]],
+    hierarchies_ambiguous: dict[int, dict[str, Any]],
+) -> dict[str, Path]:
+    project_paths.ensure_base_dirs()
+
+    write_json(project_paths.hierarchy_no_match_issue_file, hierarchies_no_match)
+    write_json(project_paths.hierarchy_ambiguous_issue_file, hierarchies_ambiguous)
+
+    return {
+        "no_match": project_paths.hierarchy_no_match_issue_file,
+        "ambiguous": project_paths.hierarchy_ambiguous_issue_file,
     }

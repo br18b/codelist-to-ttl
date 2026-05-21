@@ -1,0 +1,57 @@
+{
+  "hierarchy": {
+    "CL010482": "CL010481",
+    "CL010481": "CL010480",
+    "CL010141": "CL000025",
+    "CL000025": "CL000024",
+    "CL000024": "CL000023",
+    "CL000021": "CL000020",
+    "CL000646": "CL000647",
+    "CL000006": "CL000647",
+    "CL000645": "CL000644",
+    "CL009022": "CL009021",
+    "CL009026": "CL009025",
+    "CL000644": "https://data.gov.sk/id/legal-subject/"
+  },
+  "relationPredicates": {
+    "includes": {
+      "predicate": "dct:isPartOf",
+      "inversePredicate": "dct:hasPart"
+    }
+  },
+  "externalRelationPredicates": {
+    "https://data.gov.sk/id/legal-subject/": {
+      "includes": "skos:broader"
+    }
+  },
+  "ignore": {
+    "CL010579": {
+      "description": "NACE kódy ekonomickej činnosti",
+      "reason": "Nace kódy budú riešené samostatne"
+    },
+    "CL010141": {
+      "description": "Časť obce",
+      "reason": "Územnosprávne/samosprávne členenie bude riešené samostatne"
+    },
+    "CL000026": {
+      "description": "Katastrálne územia",
+      "reason": "Územnosprávne/samosprávne členenie bude riešené samostatne"
+    },
+    "CL000025": {
+      "description": "LAU2 - Obec",
+      "reason": "Územnosprávne/samosprávne členenie bude riešené samostatne"
+    },
+    "CL000024": {
+      "description": "LAU1 - Okres",
+      "reason": "Územnosprávne/samosprávne členenie bude riešené samostatne"
+    },
+    "CL000023": {
+      "description": "NUTS3 - Kraj",
+      "reason": "Územnosprávne/samosprávne členenie bude riešené samostatne"
+    },
+    "CL010126": {
+      "description": "Druh stavby",
+      "reason": "Číselník duplicitný k CL010143"
+    }
+  }
+}

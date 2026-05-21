@@ -12,6 +12,7 @@ class CodelistRef:
     code: str
     state: str
     temporal: bool
+    base: bool
 
 
 @dataclass
@@ -20,9 +21,14 @@ class ConversionResult:
     codelist_id: int | None = None
     ttl_file: Path | None = None
     created: bool = False
+
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     infos: list[str] = field(default_factory=list)
+
+    validation_blocked: bool = False
+    validation_block_reasons: list[str] = field(default_factory=list)
+
     integration_status: dict[str, Any] = field(default_factory=dict)
     item_duplicate_issues: list[dict[str, Any]] = field(default_factory=list)
     request_urls: dict[str, str] = field(default_factory=dict)
@@ -46,6 +52,11 @@ class ConversionResult:
     def info(self, msg: str) -> None:
         self.infos.append(msg)
         print(f"Info    [{self.code}]: {msg}")
+
+    def block_validation(self, reason: str) -> None:
+        self.validation_blocked = True
+        self.validation_block_reasons.append(reason)
+        self.info(f"validation blocked: {reason}")
 
     def add_http_5xx(
         self,
